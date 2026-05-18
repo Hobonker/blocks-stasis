@@ -31,14 +31,8 @@ int targetLevel   = 0;
 unsigned long lastDecay = 0;
 const int DECAY_INTERVAL = 60;
 
-void updateVolumeLEDs() {
-  if (millis() - lastDecay > DECAY_INTERVAL) {
-    if (currentLevel > 0) currentLevel--;
-    lastDecay = millis();
-  }
-  for (int i = 0; i < NUM_VOL_LEDS; i++)
-    digitalWrite(LED_PINS[i], i < currentLevel ? HIGH : LOW);
-}
+// --- Start gate ---
+bool gameStarted = false;
 
 // --- Game state ---
 uint32_t board[H][W];
@@ -46,6 +40,9 @@ int curPiece, curRot, curRow, curCol;
 uint32_t COLORS[7];
 int score = 0;
 int incomingPiece = 0;
+unsigned long lastFall = 0;
+#define FALL_SPEED 600
+String serialBuf = "";
 
 const int8_t PIECES[7][4][4][2] = {
   // I
@@ -64,57 +61,50 @@ const int8_t PIECES[7][4][4][2] = {
   {{{0,2},{1,0},{1,1},{1,2}},{{0,0},{1,0},{2,0},{2,1}},{{0,0},{0,1},{0,2},{1,0}},{{0,0},{0,1},{1,1},{2,1}}}
 };
 
-// Piece shapes for OLED preview — [piece][row][col], 4x4 grid
 const bool PIECE_PREVIEW[7][4][4] = {
-  // I
-  {{0,0,0,0},{1,1,1,1},{0,0,0,0},{0,0,0,0}},
-  // O
-  {{0,1,1,0},{0,1,1,0},{0,0,0,0},{0,0,0,0}},
-  // T
-  {{0,1,0,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}},
-  // S
-  {{0,1,1,0},{1,1,0,0},{0,0,0,0},{0,0,0,0}},
-  // Z
-  {{1,1,0,0},{0,1,1,0},{0,0,0,0},{0,0,0,0}},
-  // J
-  {{1,0,0,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}},
-  // L
-  {{0,0,1,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}}
+  {{0,0,0,0},{1,1,1,1},{0,0,0,0},{0,0,0,0}},  // I
+  {{0,1,1,0},{0,1,1,0},{0,0,0,0},{0,0,0,0}},  // O
+  {{0,1,0,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}},  // T
+  {{0,1,1,0},{1,1,0,0},{0,0,0,0},{0,0,0,0}},  // S
+  {{1,1,0,0},{0,1,1,0},{0,0,0,0},{0,0,0,0}},  // Z
+  {{1,0,0,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}},  // J
+  {{0,0,1,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}}   // L
 };
 
 const char* PIECE_NAMES[7] = {"I","O","T","S","Z","J","L"};
 
+// ─── Helpers ─────────────────────────────────────────────
+
+void updateVolumeLEDs() {
+  if (millis() - lastDecay > DECAY_INTERVAL) {
+    if (currentLevel > 0) currentLevel--;
+    lastDecay = millis();
+  }
+  for (int i = 0; i < NUM_VOL_LEDS; i++)
+    digitalWrite(LED_PINS[i], i < currentLevel ? HIGH : LOW);
+}
+
 void drawNextPiece(int piece) {
   oled.clearDisplay();
-
-  // Title
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
   oled.setCursor(0, 0);
   oled.print("NEXT:");
   oled.print(PIECE_NAMES[piece]);
 
-  // Draw block shape, centered, each cell = 14x14 px with 2px gap
-  int cellSize = 14;
-  int gap = 2;
+  int cellSize = 14, gap = 2;
   int gridW = 4 * (cellSize + gap);
   int gridH = 4 * (cellSize + gap);
   int startX = (SCREEN_WIDTH - gridW) / 2;
   int startY = (SCREEN_HEIGHT - gridH) / 2 + 8;
 
-  for (int r = 0; r < 4; r++) {
-    for (int c = 0; c < 4; c++) {
-      if (PIECE_PREVIEW[piece][r][c]) {
-        int x = startX + c * (cellSize + gap);
-        int y = startY + r * (cellSize + gap);
-        oled.fillRect(x, y, cellSize, cellSize, SSD1306_WHITE);
-      }
-    }
-  }
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++)
+      if (PIECE_PREVIEW[piece][r][c])
+        oled.fillRect(startX + c*(cellSize+gap), startY + r*(cellSize+gap), cellSize, cellSize, SSD1306_WHITE);
   oled.display();
 }
 
-// Flip row so game row 0 (spawn/top) maps to the physical bottom of the matrix
 int xyToLED(int row, int col) {
   int flippedRow = (H - 1) - row;
   if (flippedRow % 2 == 0) return flippedRow * W + col;
@@ -162,6 +152,48 @@ void clearLines() {
   }
 }
 
+void render() {
+  for (int r = 0; r < H; r++)
+    for (int c = 0; c < W; c++)
+      strip.setPixelColor(xyToLED(r, c), board[r][c]);
+  for (int i = 0; i < 4; i++) {
+    int r = curRow + PIECES[curPiece][curRot][i][0];
+    int c = curCol + PIECES[curPiece][curRot][i][1];
+    if (r >= 0 && r < H && c >= 0 && c < W)
+      strip.setPixelColor(xyToLED(r, c), COLORS[curPiece]);
+  }
+  strip.show();
+}
+
+void showIdleScreen() {
+  // Blue border on NeoPixel matrix, everything else black
+  strip.clear();
+  for (int c = 0; c < W; c++) {
+    strip.setPixelColor(xyToLED(0, c),   strip.Color(0, 0, 60));
+    strip.setPixelColor(xyToLED(H-1, c), strip.Color(0, 0, 60));
+  }
+  for (int r = 1; r < H-1; r++) {
+    strip.setPixelColor(xyToLED(r, 0),   strip.Color(0, 0, 60));
+    strip.setPixelColor(xyToLED(r, W-1), strip.Color(0, 0, 60));
+  }
+  strip.show();
+
+  // OLED waiting message
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(0, 20);
+  oled.print("  TETRIS");
+  oled.setCursor(0, 36);
+  oled.print("Press SPACE");
+  oled.setCursor(0, 48);
+  oled.print("  to start");
+  oled.display();
+
+  display.showNumberDec(0, false);
+  Serial.println("Waiting for start — press SPACE in the Python controller.");
+}
+
 void spawnPiece() {
   curPiece = incomingPiece;
   incomingPiece = random(7);
@@ -179,56 +211,36 @@ void spawnPiece() {
     oled.setCursor(10, 20);
     oled.print("GAME OVER");
     oled.display();
-    delay(2000);
-    incomingPiece = random(7);
-    drawNextPiece(incomingPiece);
     Serial.println("Game over! Score reset.");
+    delay(2000);
+    // Return to idle — wait for another 'S' to restart
+    gameStarted = false;
+    showIdleScreen();
   }
 }
 
-void render() {
-  for (int r = 0; r < H; r++)
-    for (int c = 0; c < W; c++)
-      strip.setPixelColor(xyToLED(r, c), board[r][c]);
-  for (int i = 0; i < 4; i++) {
-    int r = curRow + PIECES[curPiece][curRot][i][0];
-    int c = curCol + PIECES[curPiece][curRot][i][1];
-    if (r >= 0 && r < H && c >= 0 && c < W)
-      strip.setPixelColor(xyToLED(r, c), COLORS[curPiece]);
-  }
-  strip.show();
-}
-
-unsigned long lastFall = 0;
-#define FALL_SPEED 600
-String serialBuf = "";
+// ─── Setup ───────────────────────────────────────────────
 
 void setup() {
-  // Volume bar — all LOW before anything
   for (int i = 0; i < NUM_VOL_LEDS; i++) {
     pinMode(LED_PINS[i], OUTPUT);
     digitalWrite(LED_PINS[i], LOW);
   }
 
   Serial.begin(115200);
-
-  // I2C on custom pins
   Wire.begin(OLED_SDA, OLED_SCL);
 
-  // TM1637
   display.setBrightness(7);
   display.showNumberDec(0, false);
 
-  // OLED
   if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("OLED init failed");
     while (true);
   }
-  oled.setRotation(2);  // 180° rotation (upside down)
+  oled.setRotation(2);
   oled.clearDisplay();
   oled.display();
 
-  // NeoPixel
   strip.begin();
   strip.setBrightness(40);
   strip.clear();
@@ -244,14 +256,37 @@ void setup() {
 
   randomSeed(analogRead(0));
   memset(board, 0, sizeof(board));
+  score = 0;
+  gameStarted = false;
   incomingPiece = random(7);
-  spawnPiece();
-  Serial.println("Ready. Send L R U D");
+
+  // Force a full clear render so any leftover board from a previous run is wiped
+  strip.clear();
+  strip.show();
+  delay(50);
+
+  showIdleScreen();
 }
+
+// ─── Loop ────────────────────────────────────────────────
 
 void loop() {
   while (Serial.available()) {
     char c = Serial.read();
+
+    // Start command
+    if (c == 'S' && !gameStarted) {
+      gameStarted = true;
+      memset(board, 0, sizeof(board));
+      score = 0;
+      display.showNumberDec(0, false);
+      incomingPiece = random(7);
+      spawnPiece();
+      lastFall = millis();
+      Serial.println("Game started!");
+      return;
+    }
+
     if (c == '\n') {
       serialBuf.trim();
       if (serialBuf.length() > 0) {
@@ -267,7 +302,7 @@ void loop() {
         }
       }
       serialBuf = "";
-    } else if (c == 'L' || c == 'R' || c == 'U' || c == 'D') {
+    } else if (gameStarted && (c == 'L' || c == 'R' || c == 'U' || c == 'D')) {
       serialBuf = "";
       if (c == 'L' && !collides(curPiece, curRot, curRow, curCol - 1)) curCol--;
       if (c == 'R' && !collides(curPiece, curRot, curRow, curCol + 1)) curCol++;
@@ -283,6 +318,12 @@ void loop() {
     } else {
       serialBuf += c;
     }
+  }
+
+  // Only tick and render when game is live
+  if (!gameStarted) {
+    updateVolumeLEDs();
+    return;  // <-- exits before render(), idle screen stays intact
   }
 
   if (millis() - lastFall >= FALL_SPEED) {
