@@ -114,9 +114,11 @@ void drawNextPiece(int piece) {
   oled.display();
 }
 
+// Flip row so game row 0 (spawn/top) maps to the physical bottom of the matrix
 int xyToLED(int row, int col) {
-  if (row % 2 == 0) return row * W + col;
-  else return row * W + (W - 1 - col);
+  int flippedRow = (H - 1) - row;
+  if (flippedRow % 2 == 0) return flippedRow * W + col;
+  else return flippedRow * W + (W - 1 - col);
 }
 
 bool collides(int piece, int rot, int row, int col) {
