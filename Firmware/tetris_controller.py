@@ -1,8 +1,17 @@
 import cv2, mediapipe as mp, time, os, urllib.request, serial
-import pyaudio, struct, math, threading, random, signal
+import pyaudio, struct, math, threading, random, signal, sys
 import pygame
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
+
+# Raw-mode safe print — ensures \r\n so lines don't staircase in raw terminal
+def rprint(*args, **kwargs):
+    text = " ".join(str(a) for a in args)
+    sys.stdout.write(text + "\r\n")
+    sys.stdout.flush()
+
+import builtins
+builtins.print = rprint
 
 # ─── Config ──────────────────────────────────────────────
 SERIAL_PORT       = "/dev/cu.usbserial-0001"
@@ -44,13 +53,14 @@ def load_sound(path):
     print(f"Warning: sound file not found: {path}")
     return None
 
-click_sound = load_sound("soundeffects/click.wav")
-ding_sound  = load_sound("soundeffects/ding.wav")
+click_sound    = load_sound("soundeffects/click.wav")
+ding_sound     = load_sound("soundeffects/ding.wav")
+gameover_sound = load_sound("insults/Arena Hall 12.wav")
 
+# Load music but don't play yet — starts after SPACE
 if os.path.exists("soundeffects/791018.mp3"):
     pygame.mixer.music.load("soundeffects/791018.mp3")
     pygame.mixer.music.set_volume(MUSIC_VOLUME)
-    pygame.mixer.music.play(-1)
 else:
     print("Warning: soundeffects/791018.mp3 not found")
 
@@ -76,7 +86,7 @@ def load_insults(folder):
     files = [
         os.path.join(folder, f)
         for f in os.listdir(folder)
-        if f.lower().endswith(supported)
+        if f.lower().endswith(supported) and "Arena Hall 12" not in f
     ]
     if not files:
         print(f"Warning: no audio files found in {folder}")
@@ -89,7 +99,7 @@ insult_files = load_insults(INSULT_DIR)
 def insult_loop():
     while True:
         time.sleep(random.uniform(INSULT_MIN, INSULT_MAX))
-        if not insult_files:
+        if not insult_files or not game_started:
             continue
         path = random.choice(insult_files)
         try:
@@ -100,10 +110,12 @@ def insult_loop():
             print(f"  >> INSULT: {os.path.basename(path)}")
             while insult_channel.get_busy():
                 time.sleep(0.05)
-            pygame.mixer.music.unpause()
+            if game_started:
+                pygame.mixer.music.unpause()
         except Exception as e:
             print(f"  Insult play error: {e}")
-            pygame.mixer.music.unpause()
+            if game_started:
+                pygame.mixer.music.unpause()
 
 threading.Thread(target=insult_loop, daemon=True).start()
 
@@ -135,9 +147,13 @@ last_rotate_time  = 0
 mic_level         = 0
 serial_lock       = threading.Lock()
 last_line_clear   = time.time()
-cap               = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+game_started      = False
+game_over_flag    = False
+space_pressed     = False   # set by input thread, consumed by main loop
 
 # ─── Clean exit ──────────────────────────────────────────
+cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+
 def handle_exit(sig, frame):
     print("\nShutting down...")
     cap.release()
@@ -165,7 +181,7 @@ def send(name, cmd):
 
 # ─── ESP32 serial reader ─────────────────────────────────
 def serial_reader():
-    global last_line_clear
+    global last_line_clear, game_over_flag
     buf = ""
     while True:
         try:
@@ -190,6 +206,8 @@ def serial_reader():
                             last_line_clear = time.time()
                     except Exception:
                         pass
+                if "Game over" in line:
+                    game_over_flag = True
         except Exception:
             pass
         time.sleep(0.05)
@@ -222,9 +240,6 @@ def mic_thread():
                     math.log10(33) * 10 + 1
                 ))
 
-            # Send mic level to ESP32 for volume bar — rate limited to
-            # every 100ms so it doesn't flood serial, and wrapped in its
-            # own try/except so a serial hiccup can't kill the thread.
             now = time.time()
             if now - last_vol_send > 0.1:
                 last_vol_send = now
@@ -232,26 +247,23 @@ def mic_thread():
                     with serial_lock:
                         esp.write(f"{mic_level}\n".encode())
                 except Exception:
-                    pass  # serial hiccup — ignore, don't die
+                    pass
 
-            if mic_level >= 6:
+            if game_started and mic_level >= 6:
                 now = time.time()
                 if now - last_rotate_time > ROTATE_COOLDOWN:
                     last_rotate_time = now
-                    rotations = min(4, max(1, (mic_level - 3) // 2))
-                    for _ in range(rotations):
-                        try:
-                            with serial_lock:
-                                esp.write(b'U')
-                        except Exception:
-                            pass
-                        time.sleep(0.08)
-                    print(f"  >> ROTATE x{rotations} (mic level {mic_level})")
+                    try:
+                        with serial_lock:
+                            esp.write(b'U')
+                    except Exception:
+                        pass
+                    print(f"  >> ROTATE (mic level {mic_level})")
 
         except Exception as e:
             print(f"Mic error: {e}")
             time.sleep(0.1)
-            continue  # keep thread alive instead of dying on any error
+            continue
 
     stream.stop_stream()
     stream.close()
@@ -284,14 +296,71 @@ def draw_landmarks(frame, landmarks):
     for i in PALM_LANDMARKS:
         cv2.circle(frame, pts[i], 7, (0, 100, 255), -1)
 
-# ─── Camera loop ─────────────────────────────────────────
+# ─── Input thread — listens for SPACE without blocking camera loop ────
+def input_thread():
+    global space_pressed
+    import sys, tty, termios
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == ' ':
+                space_pressed = True
+            elif ch in ('\x03', '\x1b'):   # Ctrl+C or Escape → clean exit
+                handle_exit(None, None)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+threading.Thread(target=input_thread, daemon=True).start()
+
+# ─── Start game ──────────────────────────────────────────
+def start_game():
+    global game_started, game_over_flag, x_side, y_side, last_line_clear
+    game_over_flag = False
+    x_side = 0
+    y_side = 0
+    if hasattr(serial_reader, "last_score"):
+        serial_reader.last_score = 0
+    with serial_lock:
+        esp.write(b'S')
+    game_started = True
+    pygame.mixer.music.play(-1)
+    last_line_clear = time.time()
+    print("Game started!")
+
+# ─── Camera setup ────────────────────────────────────────
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 print("Warming up camera..."); time.sleep(2)
 for _ in range(10): cap.read()
-print("Running — swipe L/R to move, swipe down to drop, shout to rotate!")
 
+print("\n" + "="*50)
+print("  TETRIS CONTROLLER — ready")
+print("  Press SPACE to start the game...")
+print("="*50 + "\n")
+
+# ─── Camera loop ─────────────────────────────────────────
 while True:
+
+    # ── Game over handler ─────────────────────────────────
+    if game_over_flag and game_started:
+        game_started = False
+        insult_channel.stop()
+        pygame.mixer.music.stop()
+        print("  >> GAME OVER — playing Arena Hall (press SPACE to restart)")
+        if gameover_sound:
+            gameover_sound.set_volume(1.0)
+            insult_channel.play(gameover_sound)
+
+    # ── SPACE pressed ─────────────────────────────────────
+    if space_pressed:
+        space_pressed = False
+        insult_channel.stop()      # stop gameover audio immediately
+        pygame.mixer.music.stop()  # clean slate before restarting
+        start_game()
+
     ret, frame = cap.read()
     if not ret or frame is None:
         time.sleep(0.05); continue
@@ -313,17 +382,13 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180,180,180), 1)
     cv2.line(frame, (w-30, h-10 - 4*8), (w-10, h-10 - 4*8), (255,255,255), 1)
 
-    if time.time() - last_line_clear > NO_CLEAR_WARNING:
-        cv2.putText(frame, "CLEAR A LINE!", (cx - 120, cy - 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-
     detect_frame = cv2.resize(frame, (640, 360))
     rgb = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2RGB)
     res = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
 
-    gesture_label = "No hand"
+    gesture_label = "No hand" if not game_started else "Center — swipe to play"
 
-    if res.hand_landmarks:
+    if res.hand_landmarks and game_started:
         lm = res.hand_landmarks[0]
         draw_landmarks(frame, lm)
 
@@ -341,13 +406,12 @@ while True:
         if dx > X_TRIGGER:    new_x_side = 1
         elif dx < -X_TRIGGER: new_x_side = -1
 
-        if new_x_side != 0 and new_x_side != x_side:
+        # Only fire when crossing from neutral (0) into a side — not on return
+        if new_x_side != 0 and x_side == 0:
             if new_x_side == 1:
-                send("LEFT", "L")
-                gesture_label = ">> LEFT"
-            else:
                 send("RIGHT", "R")
-                gesture_label = ">> RIGHT"
+            else:
+                send("LEFT", "L")
         x_side = new_x_side
 
         if new_x_side == 0:
@@ -360,14 +424,14 @@ while True:
         else:
             y_side = 0
 
-    else:
+    elif not res.hand_landmarks:
         x_side = 0
         y_side = 0
-        gesture_label = "No hand"
 
-    cv2.putText(frame, gesture_label, (10, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,100), 2)
-    cv2.putText(frame, "Shout = rotate (louder = more) | Ctrl+C to quit", (10, h-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180,180,180), 1)
+    if not game_started:
+        cv2.putText(frame, "Press SPACE to start", (cx - 170, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 100), 2)
+
+
     cv2.imshow("Tetris Controller", frame)
     cv2.waitKey(1)
