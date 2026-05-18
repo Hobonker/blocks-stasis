@@ -1,6 +1,8 @@
 # TETRIVISION - Gesture Controlled Tetris
 
 <img width="4032" height="3024" alt="IMG_3820" src="https://github.com/user-attachments/assets/d786fd2a-7d7b-42d9-be6d-55144621924c" />
+<img width="1512" height="2016" alt="IMG_1306" src="https://github.com/user-attachments/assets/574320e6-7a07-4ca7-a8e6-baaba6c03758" />
+
 
 Play Tetris with your hands and your voice. A webcam tracks the center of your hand for movement to move and drop pieces, yell into the microphone to rotate pieces clockwise the louder you scream, the more the piece spins. The game itself runs on an ESP32-WROOM driving a 8x32 NeoPixel LED matrix, with a 7-segment display for score, an OLED showing the next piece shape, and a LED bar for mic input volume.
 
