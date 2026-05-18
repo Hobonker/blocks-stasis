@@ -4,7 +4,7 @@
 
 Play Tetris with your hands and your voice. A webcam tracks the center of your hand for movement to move and drop pieces, yell into the microphone to rotate pieces clockwise the louder you scream, the more the piece spins. The game itself runs on an ESP32-WROOM driving a 8x32 NeoPixel LED matrix, with a 7-segment display for score, an OLED showing the next piece shape, and a LED bar for mic input volume.
 
-#Demo
+# Demo
 
 https://www.youtube.com/watch?v=66Lr5TsQWm4
 
