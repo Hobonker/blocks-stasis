@@ -1,5 +1,5 @@
 import cv2, mediapipe as mp, time, os, urllib.request, serial
-import pyaudio, struct, math, threading, random
+import pyaudio, struct, math, threading, random, signal
 import pygame
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
@@ -19,7 +19,7 @@ COOLDOWN          = 0.50
 
 CHUNK             = 1024
 RATE              = 44100
-SILENCE_THRESHOLD = 1000
+SILENCE_THRESHOLD = 2400
 ROTATE_COOLDOWN   = 1.0
 
 PALM_LANDMARKS    = [0, 5, 9, 13, 17]
@@ -27,8 +27,12 @@ PALM_LANDMARKS    = [0, 5, 9, 13, 17]
 NO_CLEAR_WARNING  = 30.0
 MUSIC_VOLUME      = 0.35
 
-INSULT_MIN        = 8    # seconds between insults (min)
-INSULT_MAX        = 15   # seconds between insults (max)
+INSULT_MIN        = 8
+INSULT_MAX        = 15
+
+# ─── Suppress MediaPipe/TF C++ logging ───────────────────
+os.environ["GLOG_minloglevel"] = "3"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 # ─── Audio setup ─────────────────────────────────────────
 pygame.mixer.pre_init(44100, -16, 2, 512)
@@ -62,7 +66,7 @@ def play_ding():
 
 # ─── Insult audio ─────────────────────────────────────────
 INSULT_DIR     = "insults"
-insult_channel = pygame.mixer.Channel(1)  # dedicated channel, won't clash with sfx
+insult_channel = pygame.mixer.Channel(1)
 
 def load_insults(folder):
     supported = (".wav", ".mp3", ".ogg", ".m4a")
@@ -83,7 +87,6 @@ def load_insults(folder):
 insult_files = load_insults(INSULT_DIR)
 
 def insult_loop():
-    """Every 8-15 seconds: pause music, play a random insult, then resume music."""
     while True:
         time.sleep(random.uniform(INSULT_MIN, INSULT_MAX))
         if not insult_files:
@@ -95,13 +98,12 @@ def insult_loop():
             pygame.mixer.music.pause()
             insult_channel.play(snd)
             print(f"  >> INSULT: {os.path.basename(path)}")
-            # Wait for insult to finish, then resume music
             while insult_channel.get_busy():
                 time.sleep(0.05)
             pygame.mixer.music.unpause()
         except Exception as e:
             print(f"  Insult play error: {e}")
-            pygame.mixer.music.unpause()  # always resume even on error
+            pygame.mixer.music.unpause()
 
 threading.Thread(target=insult_loop, daemon=True).start()
 
@@ -133,6 +135,20 @@ last_rotate_time  = 0
 mic_level         = 0
 serial_lock       = threading.Lock()
 last_line_clear   = time.time()
+cap               = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+
+# ─── Clean exit ──────────────────────────────────────────
+def handle_exit(sig, frame):
+    print("\nShutting down...")
+    cap.release()
+    cv2.destroyAllWindows()
+    detector.close()
+    esp.close()
+    pygame.mixer.quit()
+    os._exit(0)
+
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
 
 # ─── Serial send ─────────────────────────────────────────
 def send(name, cmd):
@@ -190,6 +206,8 @@ def mic_thread():
                     frames_per_buffer=CHUNK)
     print("Mic running — shout to rotate! Louder = more rotations")
 
+    last_vol_send = 0
+
     while True:
         try:
             data    = stream.read(CHUNK, exception_on_overflow=False)
@@ -204,23 +222,36 @@ def mic_thread():
                     math.log10(33) * 10 + 1
                 ))
 
-            with serial_lock:
-                esp.write(f"{mic_level}\n".encode())
+            # Send mic level to ESP32 for volume bar — rate limited to
+            # every 100ms so it doesn't flood serial, and wrapped in its
+            # own try/except so a serial hiccup can't kill the thread.
+            now = time.time()
+            if now - last_vol_send > 0.1:
+                last_vol_send = now
+                try:
+                    with serial_lock:
+                        esp.write(f"{mic_level}\n".encode())
+                except Exception:
+                    pass  # serial hiccup — ignore, don't die
 
-            if mic_level >= 4:
+            if mic_level >= 6:
                 now = time.time()
                 if now - last_rotate_time > ROTATE_COOLDOWN:
                     last_rotate_time = now
                     rotations = min(4, max(1, (mic_level - 3) // 2))
                     for _ in range(rotations):
-                        with serial_lock:
-                            esp.write(b'U')
+                        try:
+                            with serial_lock:
+                                esp.write(b'U')
+                        except Exception:
+                            pass
                         time.sleep(0.08)
                     print(f"  >> ROTATE x{rotations} (mic level {mic_level})")
 
         except Exception as e:
             print(f"Mic error: {e}")
-            break
+            time.sleep(0.1)
+            continue  # keep thread alive instead of dying on any error
 
     stream.stop_stream()
     stream.close()
@@ -254,7 +285,6 @@ def draw_landmarks(frame, landmarks):
         cv2.circle(frame, pts[i], 7, (0, 100, 255), -1)
 
 # ─── Camera loop ─────────────────────────────────────────
-cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 print("Warming up camera..."); time.sleep(2)
@@ -341,9 +371,3 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180,180,180), 1)
     cv2.imshow("Tetris Controller", frame)
     cv2.waitKey(1)
-
-cap.release()
-cv2.destroyAllWindows()
-detector.close()
-esp.close()
-pygame.mixer.quit()
