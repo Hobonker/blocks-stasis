@@ -27,4 +27,4 @@ Play Tetris with your hands and your voice. A webcam tracks the center of your h
 | Jumper Cables | 20 |
 | 3D Printed Case | 1 |
 | Computer | 1 |
-
+| LED Lights | 1 |
