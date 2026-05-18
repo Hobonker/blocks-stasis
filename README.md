@@ -5,7 +5,7 @@ Play Tetris with your hands and your voice. A webcam tracks the center of your h
 # How To Play
 
 - Always keep hand open palm facing the screen
-- Place hand center of the screen (neutral zone)
+- Place hand at center of the screen (neutral zone)
 - Swipe your hand to the left or right to move the falling piece, respectively
 - Swipe your hand down to hard drop
 - Yell to rotate the falling piece clockwise
@@ -22,4 +22,8 @@ Play Tetris with your hands and your voice. A webcam tracks the center of your h
 | USB cable (ESP32 to computer) | 1 |
 | Webcam (built-in or external) | 1 |
 | Microphone (built-in or external) | 1 |
+| Computer with USB-C | 1 |
+| Perf Board | 1 |
+| Jumper Cables | 20 |
+| 3D Printed Case | 1 |
 
